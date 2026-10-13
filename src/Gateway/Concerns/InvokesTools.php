@@ -10,6 +10,8 @@ use Laravel\Ai\Gateway\RunContext;
 use Laravel\Ai\Providers\Tools\ToolSearch;
 use Laravel\Ai\Tools\Request;
 use Laravel\Ai\Tools\ToolNameResolver;
+use ReflectionClass;
+use RuntimeException;
 use Throwable;
 
 trait InvokesTools
@@ -33,10 +35,7 @@ trait InvokesTools
 
             // Only the handler itself may fail the tool call, so a listener that throws is never reported as a tool failure...
             try {
-                $result = $tool->handle(new Request($arguments, $toolCallId, $toolInvocationId));
-            } catch (ValidationException $exception) {
-                // Validation failures are returned to the model so it can correct the arguments and retry...
-                $result = implode(' ', $exception->validator->errors()->all()) ?: $exception->getMessage();
+                $result = self::handleTool($tool, $arguments, $toolCallId, $toolInvocationId);
             } catch (Throwable $exception) {
                 $context?->toolFailed($tool, $arguments, $exception, $toolInvocationId, $this->elapsedMilliseconds($startedAt));
 
@@ -69,5 +68,94 @@ trait InvokesTools
         }
 
         return null;
+    }
+
+    /**
+     * Run the handler. Validation errors are text for the model, not a failed call.
+     *
+     * @param  array<string, mixed>  $arguments
+     */
+    protected static function handleTool(Tool $tool, array $arguments, ?string $toolCallId, string $toolInvocationId): mixed
+    {
+        try {
+            return $tool->handle(new Request($arguments, $toolCallId, $toolInvocationId));
+        } catch (ValidationException $exception) {
+            // Validation failures are returned to the model so it can correct the arguments and retry...
+            return implode(' ', $exception->validator->errors()->all()) ?: $exception->getMessage();
+        }
+    }
+
+    /**
+     * @return array{exception: class-string<Throwable>, message: string, code: int, parameters: array<string, mixed>}
+     */
+    protected static function toolFailure(Throwable $exception): array
+    {
+        return [
+            'exception' => $exception::class,
+            'message' => $exception->getMessage(),
+            'code' => (int) $exception->getCode(),
+            'parameters' => self::exceptionParameters($exception),
+        ];
+    }
+
+    /**
+     * Rebuild a failure that crossed a process boundary.
+     *
+     * @param  array{exception: class-string<Throwable>, message: string, code: int, parameters: array<string, mixed>}  $failure
+     */
+    protected static function exceptionFromFailure(array $failure): Throwable
+    {
+        if ($failure['parameters'] !== []) {
+            return new ($failure['exception'])(...$failure['parameters']);
+        }
+
+        $constructor = (new ReflectionClass($failure['exception']))->getConstructor();
+
+        if ($constructor === null || $constructor->getDeclaringClass()->getName() !== $failure['exception']) {
+            return new ($failure['exception'])($failure['message'], $failure['code']);
+        }
+
+        return new RuntimeException($failure['message'], $failure['code']);
+    }
+
+    /**
+     * Constructor arguments stored on the exception, the same way the process driver reads them.
+     *
+     * @return array<string, mixed>
+     */
+    protected static function exceptionParameters(Throwable $exception): array
+    {
+        $reflection = new ReflectionClass($exception);
+        $constructor = $reflection->getConstructor();
+
+        if ($constructor === null || $constructor->getDeclaringClass()->getName() !== $reflection->getName()) {
+            return [];
+        }
+
+        $parameters = [];
+
+        foreach ($constructor->getParameters() as $parameter) {
+            $property = $reflection->hasProperty($parameter->name) ? $reflection->getProperty($parameter->name) : null;
+
+            if ($property?->isPublic()) {
+                $value = $property->getValue($exception);
+            } elseif ($parameter->name === 'message') {
+                $value = $exception->getMessage();
+            } elseif ($parameter->name === 'code') {
+                $value = (int) $exception->getCode();
+            } elseif ($parameter->isDefaultValueAvailable()) {
+                continue;
+            } else {
+                return [];
+            }
+
+            if (! is_null($value) && ! is_scalar($value)) {
+                return [];
+            }
+
+            $parameters[$parameter->name] = $value;
+        }
+
+        return $parameters;
     }
 }

@@ -42,7 +42,8 @@
     },
     "suggest": {
         "aws/aws-sdk-php": "Required to use the Bedrock provider.",
-        "laravel/mcp": "Required to use MCP client tools or MCP server tools with Laravel AI agents."
+        "laravel/mcp": "Required to use MCP client tools or MCP server tools with Laravel AI agents.",
+        "spatie/fork": "Required to exercise the fork concurrency driver (^1.2)."
     },
     "minimum-stability": "dev",
     "prefer-stable": true,

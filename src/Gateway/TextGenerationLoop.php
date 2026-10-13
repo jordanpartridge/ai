@@ -5,10 +5,12 @@ namespace Laravel\Ai\Gateway;
 use Closure;
 use Generator;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Concurrency;
 use Illuminate\Support\Str;
 use Laravel\Ai\Approvals\Approval;
 use Laravel\Ai\Approvals\Decision;
 use Laravel\Ai\Approvals\PendingApproval;
+use Laravel\Ai\Attributes\Concurrent;
 use Laravel\Ai\Attributes\RepairToolCalls;
 use Laravel\Ai\Concerns\JoinsReasoning;
 use Laravel\Ai\Contracts\Approvable;
@@ -59,6 +61,7 @@ use Laravel\Ai\Tools\AgentTool;
 use Laravel\Ai\Tools\Request;
 use Laravel\Ai\Tools\ToolNameResolver;
 use LogicException;
+use ReflectionClass;
 use Throwable;
 
 class TextGenerationLoop
@@ -752,12 +755,89 @@ class TextGenerationLoop
     {
         [$resolved, $pendingApprovals] = $this->resolveToolCalls($toolCalls, $tools, $isFinalStep);
 
-        $toolResults = array_map(
-            fn (array $pair): ToolResult => $this->resolvedToolResult($pair[0], $pair[1], $isFinalStep, $tools, $context),
-            $resolved,
-        );
+        $toolResults = [];
+        $batch = [];
+
+        foreach ($resolved as $index => [$toolCall, $tool]) {
+            if (! $isFinalStep && $tool instanceof Tool && (new ReflectionClass($tool))->getAttributes(Concurrent::class) !== []) {
+                $batch[$index] = [$toolCall, $tool];
+
+                continue;
+            }
+
+            array_push($toolResults, ...$this->runConcurrentBatch($batch, $context));
+            $batch = [];
+            $toolResults[] = $this->resolvedToolResult($toolCall, $tool, $isFinalStep, $tools, $context);
+        }
+
+        array_push($toolResults, ...$this->runConcurrentBatch($batch, $context));
 
         return [$toolResults, $pendingApprovals];
+    }
+
+    /**
+     * Run one opted-in call normally. Run two or more together, then record them in call order.
+     *
+     * @param  array<int, array{ToolCall, Tool}>  $batch
+     * @return array<int, ToolResult>
+     */
+    protected function runConcurrentBatch(array $batch, ?RunContext $context): array
+    {
+        if (count($batch) < 2) {
+            return array_map(
+                fn (array $pair): ToolResult => $this->resolvedToolResult($pair[0], $pair[1], false, [], $context),
+                $batch,
+            );
+        }
+
+        $ids = [];
+        $tasks = [];
+
+        foreach ($batch as $index => [$toolCall, $tool]) {
+            $ids[$index] = $toolInvocationId = (string) Str::uuid7();
+            $arguments = $toolCall->arguments;
+            $toolCallId = $toolCall->id;
+            $invocationId = $context?->invocationId;
+
+            $tasks[$index] = static function () use ($tool, $arguments, $toolCallId, $invocationId, $toolInvocationId): array {
+                $startedAt = hrtime(true);
+
+                try {
+                    $result = ParentInvocation::within(
+                        $invocationId,
+                        $toolInvocationId,
+                        fn (): mixed => self::handleTool($tool, $arguments, $toolCallId, $toolInvocationId),
+                    );
+
+                    return ['ok' => true, 'result' => $result, 'ms' => (hrtime(true) - $startedAt) / 1e6];
+                } catch (Throwable $exception) {
+                    return ['ok' => false, 'ms' => (hrtime(true) - $startedAt) / 1e6, ...self::toolFailure($exception)];
+                }
+            };
+        }
+
+        $ran = Concurrency::run($tasks);
+        $toolResults = [];
+
+        foreach ($batch as $index => [$toolCall, $tool]) {
+            $outcome = $ran[$index];
+
+            $context?->invokingTool($tool, $toolCall->arguments, $ids[$index]);
+
+            if (! $outcome['ok']) {
+                $exception = self::exceptionFromFailure($outcome);
+
+                $context?->toolFailed($tool, $toolCall->arguments, $exception, $ids[$index], $outcome['ms']);
+
+                throw $exception;
+            }
+
+            $context?->toolInvoked($tool, $toolCall->arguments, $outcome['result'], $ids[$index], $outcome['ms']);
+
+            $toolResults[] = $this->recordedToolResult($this->toolResult($toolCall, (string) $outcome['result']), $context);
+        }
+
+        return $toolResults;
     }
 
     /**
