@@ -5,10 +5,12 @@ namespace Laravel\Ai\Gateway;
 use Closure;
 use Generator;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Concurrency;
 use Illuminate\Support\Str;
 use Laravel\Ai\Approvals\Approval;
 use Laravel\Ai\Approvals\Decision;
 use Laravel\Ai\Approvals\PendingApproval;
+use Laravel\Ai\Attributes\Concurrent;
 use Laravel\Ai\Attributes\RepairToolCalls;
 use Laravel\Ai\Concerns\JoinsReasoning;
 use Laravel\Ai\Contracts\Approvable;
@@ -59,6 +61,8 @@ use Laravel\Ai\Tools\AgentTool;
 use Laravel\Ai\Tools\Request;
 use Laravel\Ai\Tools\ToolNameResolver;
 use LogicException;
+use ReflectionClass;
+use RuntimeException;
 use Throwable;
 
 class TextGenerationLoop
@@ -752,12 +756,106 @@ class TextGenerationLoop
     {
         [$resolved, $pendingApprovals] = $this->resolveToolCalls($toolCalls, $tools, $isFinalStep);
 
-        $toolResults = array_map(
-            fn (array $pair): ToolResult => $this->resolvedToolResult($pair[0], $pair[1], $isFinalStep, $tools, $context),
-            $resolved,
-        );
+        $outcomes = $this->runConcurrentTools($resolved, $isFinalStep, $context);
+
+        $failure = null;
+        $toolResults = [];
+
+        foreach ($resolved as $index => [$toolCall, $tool]) {
+            if (! isset($outcomes[$index])) {
+                $toolResults[] = $this->resolvedToolResult($toolCall, $tool, $isFinalStep, $tools, $context);
+
+                continue;
+            }
+
+            $outcome = $outcomes[$index];
+
+            if (isset($outcome['class'])) {
+                $exception = $this->concurrentException($outcome);
+
+                $context?->toolFailed($tool, $toolCall->arguments, $exception, $outcome['id'], $outcome['ms']);
+
+                $failure ??= $exception;
+
+                continue;
+            }
+
+            $context?->toolInvoked($tool, $toolCall->arguments, $outcome['result'], $outcome['id'], $outcome['ms']);
+
+            $toolResults[] = $this->recordedToolResult(
+                $this->toolResult($toolCall, (string) $outcome['result']),
+                $context,
+            );
+        }
+
+        if ($failure instanceof Throwable) {
+            throw $failure;
+        }
 
         return [$toolResults, $pendingApprovals];
+    }
+
+    /**
+     * Run every #[Concurrent] call in this step and keep call order.
+     *
+     * @param  array<int, array{ToolCall, ?Tool}>  $resolved
+     * @return array<int, array<string, mixed>>
+     */
+    protected function runConcurrentTools(array $resolved, bool $isFinalStep, ?RunContext $context): array
+    {
+        $tasks = [];
+
+        foreach ($resolved as $index => [$toolCall, $tool]) {
+            if ($isFinalStep || ! $tool instanceof Tool || (new ReflectionClass($tool))->getAttributes(Concurrent::class) === []) {
+                continue;
+            }
+
+            $id = (string) Str::uuid7();
+
+            $context?->invokingTool($tool, $toolCall->arguments, $id);
+
+            $arguments = $toolCall->arguments;
+            $toolCallId = $toolCall->id;
+            $invocationId = $context?->invocationId;
+
+            $tasks[$index] = static function () use ($tool, $arguments, $toolCallId, $invocationId, $id): array {
+                $startedAt = hrtime(true);
+
+                try {
+                    $result = ParentInvocation::within(
+                        $invocationId,
+                        $id,
+                        fn (): mixed => self::resultOf($tool, $arguments, $toolCallId, $id),
+                    );
+                } catch (Throwable $exception) {
+                    return ['class' => $exception::class, 'message' => $exception->getMessage(), 'ms' => (hrtime(true) - $startedAt) / 1e6, 'id' => $id];
+                }
+
+                return ['result' => $result, 'ms' => (hrtime(true) - $startedAt) / 1e6, 'id' => $id];
+            };
+        }
+
+        return $tasks === [] ? [] : Concurrency::run($tasks);
+    }
+
+    /**
+     * Rebuild a tool exception from the plain data a concurrent call returned.
+     *
+     * @param  array<string, mixed>  $outcome
+     */
+    protected function concurrentException(array $outcome): Throwable
+    {
+        $class = $outcome['class'];
+
+        if (! is_string($class) || ! is_subclass_of($class, Throwable::class)) {
+            return new RuntimeException((string) $outcome['message']);
+        }
+
+        try {
+            return new $class((string) $outcome['message']);
+        } catch (Throwable) {
+            return new RuntimeException((string) $outcome['message']);
+        }
     }
 
     /**

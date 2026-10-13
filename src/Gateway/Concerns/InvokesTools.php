@@ -33,10 +33,7 @@ trait InvokesTools
 
             // Only the handler itself may fail the tool call, so a listener that throws is never reported as a tool failure...
             try {
-                $result = $tool->handle(new Request($arguments, $toolCallId, $toolInvocationId));
-            } catch (ValidationException $exception) {
-                // Validation failures are returned to the model so it can correct the arguments and retry...
-                $result = implode(' ', $exception->validator->errors()->all()) ?: $exception->getMessage();
+                $result = static::resultOf($tool, $arguments, $toolCallId, $toolInvocationId);
             } catch (Throwable $exception) {
                 $context?->toolFailed($tool, $arguments, $exception, $toolInvocationId, $this->elapsedMilliseconds($startedAt));
 
@@ -47,6 +44,20 @@ trait InvokesTools
 
             return (string) $result;
         });
+    }
+
+    /**
+     * Run the handler, returning validation errors as text the model can correct.
+     *
+     * @param  array<string, mixed>  $arguments
+     */
+    protected static function resultOf(Tool $tool, array $arguments, ?string $toolCallId, string $toolInvocationId): mixed
+    {
+        try {
+            return $tool->handle(new Request($arguments, $toolCallId, $toolInvocationId));
+        } catch (ValidationException $exception) {
+            return implode(' ', $exception->validator->errors()->all()) ?: $exception->getMessage();
+        }
     }
 
     /**
