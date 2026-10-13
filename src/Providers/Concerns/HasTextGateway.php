@@ -2,6 +2,7 @@
 
 namespace Laravel\Ai\Providers\Concerns;
 
+use Illuminate\Container\Container;
 use Laravel\Ai\Contracts\Gateway\StepTextGateway;
 use Laravel\Ai\Gateway\TextGenerationLoop;
 
@@ -35,6 +36,8 @@ trait HasTextGateway
      */
     public function textGenerationLoop(): TextGenerationLoop
     {
-        return $this->textGenerationLoop ??= new TextGenerationLoop($this->textGateway());
+        return $this->textGenerationLoop ??= Container::getInstance()->make(
+            TextGenerationLoop::class, ['gateway' => $this->textGateway()],
+        );
     }
 }

@@ -752,12 +752,22 @@ class TextGenerationLoop
     {
         [$resolved, $pendingApprovals] = $this->resolveToolCalls($toolCalls, $tools, $isFinalStep);
 
-        $toolResults = array_map(
+        return [$this->invokeResolvedTools($resolved, $isFinalStep, $tools, $context), $pendingApprovals];
+    }
+
+    /**
+     * Run the tool calls that are clear to execute.
+     *
+     * @param  array<int, array{0: ToolCall, 1: ?Tool}>  $resolved
+     * @param  array<Tool|ProviderTool>  $tools
+     * @return array<int, ToolResult>
+     */
+    protected function invokeResolvedTools(array $resolved, bool $isFinalStep, array $tools, ?RunContext $context): array
+    {
+        return array_map(
             fn (array $pair): ToolResult => $this->resolvedToolResult($pair[0], $pair[1], $isFinalStep, $tools, $context),
             $resolved,
         );
-
-        return [$toolResults, $pendingApprovals];
     }
 
     /**
