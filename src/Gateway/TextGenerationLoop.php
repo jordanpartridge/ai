@@ -4,8 +4,8 @@ namespace Laravel\Ai\Gateway;
 
 use Closure;
 use Generator;
+use Illuminate\Concurrency\ConcurrencyManager;
 use Illuminate\Support\Collection;
-use Illuminate\Support\Facades\Concurrency;
 use Illuminate\Support\Str;
 use Laravel\Ai\Approvals\Approval;
 use Laravel\Ai\Approvals\Decision;
@@ -877,7 +877,7 @@ class TextGenerationLoop
             };
         }
 
-        $ran = Concurrency::run($tasks);
+        $ran = resolve(ConcurrencyManager::class)->run($tasks);
         $outcomes = [];
 
         foreach ($batch as $index => [$toolCall, $tool]) {
