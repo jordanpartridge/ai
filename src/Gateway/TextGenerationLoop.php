@@ -756,20 +756,56 @@ class TextGenerationLoop
     {
         [$resolved, $pendingApprovals] = $this->resolveToolCalls($toolCalls, $tools, $isFinalStep);
 
-        $outcomes = $this->runConcurrentTools($resolved, $isFinalStep, $context);
-
-        $failure = null;
         $toolResults = [];
+        $batch = [];
 
-        foreach ($resolved as $index => [$toolCall, $tool]) {
-            if (! isset($outcomes[$index])) {
-                $toolResults[] = $this->resolvedToolResult($toolCall, $tool, $isFinalStep, $tools, $context);
+        foreach ($resolved as [$toolCall, $tool]) {
+            if ($this->runsConcurrently($tool, $isFinalStep)) {
+                $batch[] = [$toolCall, $tool];
 
                 continue;
             }
 
-            $outcome = $outcomes[$index];
+            $toolResults = $this->appendConcurrentBatch($toolResults, $batch, $isFinalStep, $tools, $context);
+            $batch = [];
 
+            $toolResults[] = $this->resolvedToolResult($toolCall, $tool, $isFinalStep, $tools, $context);
+        }
+
+        return [$this->appendConcurrentBatch($toolResults, $batch, $isFinalStep, $tools, $context), $pendingApprovals];
+    }
+
+    /**
+     * A call joins the current batch only when it sits beside another opted-in call.
+     */
+    protected function runsConcurrently(?Tool $tool, bool $isFinalStep): bool
+    {
+        return ! $isFinalStep
+            && $tool instanceof Tool
+            && (new ReflectionClass($tool))->getAttributes(Concurrent::class) !== [];
+    }
+
+    /**
+     * Run one adjacent run of opted-in calls, then stop the step if one of them threw.
+     *
+     * @param  array<int, ToolResult>  $toolResults
+     * @param  array<int, array{ToolCall, Tool}>  $batch
+     * @param  array<Tool|ProviderTool>  $tools
+     * @return array<int, ToolResult>
+     */
+    protected function appendConcurrentBatch(array $toolResults, array $batch, bool $isFinalStep, array $tools, ?RunContext $context): array
+    {
+        if (count($batch) < 2) {
+            foreach ($batch as [$toolCall, $tool]) {
+                $toolResults[] = $this->resolvedToolResult($toolCall, $tool, $isFinalStep, $tools, $context);
+            }
+
+            return $toolResults;
+        }
+
+        $failure = null;
+
+        foreach ($this->runConcurrentTools($batch, $context) as [$toolCall, $tool, $outcome]) {
             if (isset($outcome['class'])) {
                 $exception = $this->concurrentException($outcome);
 
@@ -792,24 +828,18 @@ class TextGenerationLoop
             throw $failure;
         }
 
-        return [$toolResults, $pendingApprovals];
+        return $toolResults;
     }
 
     /**
-     * Run every #[Concurrent] call in this step and keep call order.
-     *
-     * @param  array<int, array{ToolCall, ?Tool}>  $resolved
-     * @return array<int, array<string, mixed>>
+     * @param  array<int, array{ToolCall, Tool}>  $batch
+     * @return array<int, array{ToolCall, Tool, array<string, mixed>}>
      */
-    protected function runConcurrentTools(array $resolved, bool $isFinalStep, ?RunContext $context): array
+    protected function runConcurrentTools(array $batch, ?RunContext $context): array
     {
         $tasks = [];
 
-        foreach ($resolved as $index => [$toolCall, $tool]) {
-            if ($isFinalStep || ! $tool instanceof Tool || (new ReflectionClass($tool))->getAttributes(Concurrent::class) === []) {
-                continue;
-            }
-
+        foreach ($batch as $index => [$toolCall, $tool]) {
             $id = (string) Str::uuid7();
 
             $context?->invokingTool($tool, $toolCall->arguments, $id);
@@ -828,34 +858,57 @@ class TextGenerationLoop
                         fn (): mixed => self::resultOf($tool, $arguments, $toolCallId, $id),
                     );
                 } catch (Throwable $exception) {
-                    return ['class' => $exception::class, 'message' => $exception->getMessage(), 'ms' => (hrtime(true) - $startedAt) / 1e6, 'id' => $id];
+                    $failure = [
+                        'class' => $exception::class,
+                        'message' => $exception->getMessage(),
+                        'code' => (int) $exception->getCode(),
+                        'ms' => (hrtime(true) - $startedAt) / 1e6,
+                        'id' => $id,
+                    ];
+
+                    if (config('concurrency.default') === 'sync') {
+                        $failure['exception'] = $exception;
+                    }
+
+                    return $failure;
                 }
 
                 return ['result' => $result, 'ms' => (hrtime(true) - $startedAt) / 1e6, 'id' => $id];
             };
         }
 
-        return $tasks === [] ? [] : Concurrency::run($tasks);
+        $ran = Concurrency::run($tasks);
+        $outcomes = [];
+
+        foreach ($batch as $index => [$toolCall, $tool]) {
+            $outcomes[] = [$toolCall, $tool, $ran[$index]];
+        }
+
+        return $outcomes;
     }
 
     /**
-     * Rebuild a tool exception from the plain data a concurrent call returned.
-     *
      * @param  array<string, mixed>  $outcome
      */
     protected function concurrentException(array $outcome): Throwable
     {
-        $class = $outcome['class'];
-
-        if (! is_string($class) || ! is_subclass_of($class, Throwable::class)) {
-            return new RuntimeException((string) $outcome['message']);
+        if (($outcome['exception'] ?? null) instanceof Throwable) {
+            return $outcome['exception'];
         }
 
-        try {
-            return new $class((string) $outcome['message']);
-        } catch (Throwable) {
-            return new RuntimeException((string) $outcome['message']);
+        $class = $outcome['class'] ?? null;
+        $message = (string) ($outcome['message'] ?? '');
+        $code = (int) ($outcome['code'] ?? 0);
+
+        if (is_string($class) && is_subclass_of($class, Throwable::class)) {
+            try {
+                return new $class($message, $code);
+            } catch (Throwable) {
+                return new RuntimeException($message, $code);
+            }
         }
+
+        return new RuntimeException($message, $code);
     }
 
     /**

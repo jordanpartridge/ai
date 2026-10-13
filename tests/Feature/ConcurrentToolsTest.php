@@ -13,26 +13,27 @@ use Laravel\Ai\Responses\Data\FinishReason;
 use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\Data\TextUsage;
 use Laravel\Ai\Responses\Data\ToolCall;
-use Tests\Fixtures\Tools\FixedNumberGenerator;
 use Tests\Fixtures\Tools\LookupTool;
 
 beforeEach(function (): void {
     config(['concurrency.default' => 'sync']);
 
     LookupTool::$runs = 0;
+    LookupTool::$trace = [];
+    LookupTool::$thrown = null;
 });
 
 test('lookups the model asked for come back in that order', function () {
     $agent = recordsAgent([
         new LookupTool('weather', '72 and sunny'),
-        new FixedNumberGenerator,
+        new SequentialLookup('reference', '72019'),
         new LookupTool('inventory', '14 units'),
     ]);
 
     Ai::fakeAgent($agent::class, [
         toolStep([
             ['call_inventory', 'inventory'],
-            ['call_number', 'FixedNumberGenerator'],
+            ['call_number', 'reference'],
             ['call_weather', 'weather'],
         ]),
         'Inventory is 14 units, reference 72019, and it is 72 and sunny.',
@@ -44,7 +45,8 @@ test('lookups the model asked for come back in that order', function () {
         '14 units',
         '72019',
         '72 and sunny',
-    ])->and($response->text)->toBe('Inventory is 14 units, reference 72019, and it is 72 and sunny.');
+    ])->and(LookupTool::$trace)->toBe(['inventory', 'reference', 'weather'])
+        ->and($response->text)->toBe('Inventory is 14 units, reference 72019, and it is 72 and sunny.');
 });
 
 test('a failed lookup still lets the others finish, then throws', function () {
@@ -52,7 +54,7 @@ test('a failed lookup still lets the others finish, then throws', function () {
 
     $agent = recordsAgent([
         new LookupTool('weather', '72 and sunny'),
-        new LookupTool('inventory', error: 'Inventory service timed out.'),
+        new LookupTool('inventory', error: 'Inventory service timed out.', code: 7),
     ]);
 
     Ai::fakeAgent($agent::class, [
@@ -62,15 +64,49 @@ test('a failed lookup still lets the others finish, then throws', function () {
         ]),
     ]);
 
-    expect(fn () => $agent->prompt('Check the weather and the inventory'))
-        ->toThrow(RuntimeException::class, 'Inventory service timed out.');
+    $caught = null;
 
-    expect(LookupTool::$runs)->toBe(2);
+    try {
+        $agent->prompt('Check the weather and the inventory');
+    } catch (Throwable $caught) {
+    }
+
+    expect($caught)->toBe(LookupTool::$thrown)
+        ->and($caught->getCode())->toBe(7)
+        ->and(LookupTool::$runs)->toBe(2);
 
     Event::assertDispatched(ToolInvoked::class, fn (ToolInvoked $event): bool => $event->result === '72 and sunny');
     Event::assertDispatchedTimes(ToolInvoked::class, 1);
-    Event::assertDispatched(ToolFailed::class, fn (ToolFailed $event): bool => $event->exception->getMessage() === 'Inventory service timed out.');
+    Event::assertDispatched(ToolFailed::class, fn (ToolFailed $event): bool => $event->exception === LookupTool::$thrown);
     Event::assertDispatched(AgentFailed::class);
+});
+
+test('an ordinary tool keeps its place and stops the calls after it when it throws', function () {
+    Event::fake();
+
+    $agent = recordsAgent([
+        new LookupTool('weather', '72 and sunny'),
+        new SequentialLookup('reference', error: 'Reference book is missing.'),
+        new LookupTool('inventory', '14 units'),
+    ]);
+
+    Ai::fakeAgent($agent::class, [
+        toolStep([
+            ['call_weather', 'weather'],
+            ['call_reference', 'reference'],
+            ['call_inventory', 'inventory'],
+        ]),
+    ]);
+
+    expect(fn () => $agent->prompt('Check the weather, the reference, and the inventory'))
+        ->toThrow(RuntimeException::class, 'Reference book is missing.');
+
+    expect(LookupTool::$trace)->toBe(['weather', 'reference']);
+
+    Event::assertDispatched(ToolInvoked::class, fn (ToolInvoked $event): bool => $event->result === '72 and sunny');
+    Event::assertDispatched(ToolFailed::class, fn (ToolFailed $event): bool => $event->exception->getMessage() === 'Reference book is missing.');
+    Event::assertDispatchedTimes(ToolInvoked::class, 1);
+    Event::assertDispatchedTimes(ToolFailed::class, 1);
 });
 
 test('a validation error comes back as text beside the other lookup', function () {
@@ -139,6 +175,41 @@ test('streaming still returns the lookups in call order', function () {
     expect($results)->toBe(['14 units', '72 and sunny']);
 });
 
+test('adjacent lookups overlap under the process driver', function () {
+    $root = dirname(__DIR__, 2);
+    $link = $root.'/vendor/orchestra/testbench-core/laravel/vendor/autoload.php';
+
+    if (! is_file($link)) {
+        mkdir(dirname($link), 0777, true);
+        symlink($root.'/vendor/autoload.php', $link);
+    }
+
+    $gate = sys_get_temp_dir().'/ai-concurrent-'.uniqid('', true);
+
+    config(['concurrency.default' => 'process']);
+
+    $agent = recordsAgent([
+        new LookupTool('weather', gate: $gate),
+        new LookupTool('inventory', gate: $gate),
+    ]);
+
+    Ai::fakeAgent($agent::class, [
+        toolStep([
+            ['call_inventory', 'inventory'],
+            ['call_weather', 'weather'],
+        ]),
+        'Both ready.',
+    ]);
+
+    try {
+        $response = $agent->prompt('Check inventory and the weather');
+
+        expect($response->toolResults->pluck('result')->all())->toBe(['overlapped', 'overlapped']);
+    } finally {
+        @unlink($gate);
+    }
+});
+
 /**
  * @param  array<int, array{0: string, 1: string}>  $calls
  */
@@ -178,3 +249,5 @@ function recordsAgent(array $tools): Agent
         }
     };
 }
+
+class SequentialLookup extends LookupTool {}
