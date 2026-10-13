@@ -1,23 +1,7 @@
 <?php
 
-$root = dirname(__DIR__);
-$wrapper = sys_get_temp_dir().'/ai-concurrent-artisan.php';
-
-file_put_contents($wrapper, <<<PHP
-#!/usr/bin/env php
-<?php
-
-\$root = '{$root}';
-putenv('TESTBENCH_WORKING_PATH='.\$root);
-\$_ENV['TESTBENCH_WORKING_PATH'] = \$root;
-\$_SERVER['TESTBENCH_WORKING_PATH'] = \$root;
-
-require \$root.'/vendor/orchestra/testbench-core/laravel/artisan';
-
-PHP);
-
 if (! defined('ARTISAN_BINARY')) {
-    define('ARTISAN_BINARY', $wrapper);
+    define('ARTISAN_BINARY', __DIR__.'/Fixtures/concurrent-artisan.php');
 }
 
 use JMac\Testing\Integrations\PHPUnit\VerifiesDoubles;

@@ -152,11 +152,6 @@ class FakeTextGateway implements StepTextGateway
      */
     protected function toStepResponse(mixed $response, TextProvider $provider, string $model): StepResponse
     {
-        // A faked step can carry several tool calls at once.
-        if ($response instanceof StepResponse) {
-            return $response;
-        }
-
         if ($response instanceof ToolCall) {
             return new StepResponse(
                 '', [$response], FinishReason::ToolCalls, new TextUsage, new Meta($provider->name(), $model)

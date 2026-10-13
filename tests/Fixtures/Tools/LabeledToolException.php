@@ -2,12 +2,20 @@
 
 namespace Tests\Fixtures\Tools;
 
+use Illuminate\Support\Collection;
 use RuntimeException;
 
 class LabeledToolException extends RuntimeException
 {
-    public function __construct(public string $label, string $message = 'kaboom', int $code = 7)
-    {
+    /**
+     * @param  Collection<int, string>  $items
+     */
+    public function __construct(
+        public string $label,
+        public Collection $items,
+        string $message = 'kaboom',
+        int $code = 7,
+    ) {
         parent::__construct($message, $code);
     }
 }

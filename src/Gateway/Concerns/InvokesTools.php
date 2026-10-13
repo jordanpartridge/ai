@@ -86,7 +86,7 @@ trait InvokesTools
     }
 
     /**
-     * @return array{exception: class-string<Throwable>, message: string, code: int, parameters: array<string, mixed>}
+     * @return array{exception: class-string<Throwable>, message: string, code: int, parameters: array<string, mixed>|null}
      */
     protected static function toolFailure(Throwable $exception): array
     {
@@ -101,29 +101,39 @@ trait InvokesTools
     /**
      * Rebuild a failure that crossed a process boundary.
      *
-     * @param  array{exception: class-string<Throwable>, message: string, code: int, parameters: array<string, mixed>}  $failure
+     * @param  array{exception: class-string<Throwable>, message: string, code: int, parameters: array<string, mixed>|null}  $failure
      */
     protected static function exceptionFromFailure(array $failure): Throwable
     {
-        if ($failure['parameters'] !== []) {
-            return new ($failure['exception'])(...$failure['parameters']);
-        }
+        try {
+            if ($failure['parameters'] === null) {
+                return new RuntimeException($failure['message'], $failure['code']);
+            }
 
-        $constructor = (new ReflectionClass($failure['exception']))->getConstructor();
+            if ($failure['parameters'] !== []) {
+                return new ($failure['exception'])(...$failure['parameters']);
+            }
 
-        if ($constructor === null || $constructor->getDeclaringClass()->getName() !== $failure['exception']) {
+            $constructor = (new ReflectionClass($failure['exception']))->getConstructor();
+
+            if ($constructor !== null && $constructor->getDeclaringClass()->getName() === $failure['exception']) {
+                return new ($failure['exception']);
+            }
+
             return new ($failure['exception'])($failure['message'], $failure['code']);
+        } catch (Throwable $exception) {
+            return new RuntimeException($failure['message'], $failure['code'], $exception);
         }
-
-        return new RuntimeException($failure['message'], $failure['code']);
     }
 
     /**
      * Constructor arguments stored on the exception, the same way the process driver reads them.
      *
-     * @return array<string, mixed>
+     * Null means the exception cannot be rebuilt. An empty array means it takes no arguments.
+     *
+     * @return array<string, mixed>|null
      */
-    protected static function exceptionParameters(Throwable $exception): array
+    protected static function exceptionParameters(Throwable $exception): ?array
     {
         $reflection = new ReflectionClass($exception);
         $constructor = $reflection->getConstructor();
@@ -146,16 +156,30 @@ trait InvokesTools
             } elseif ($parameter->isDefaultValueAvailable()) {
                 continue;
             } else {
-                return [];
+                return null;
             }
 
-            if (! is_null($value) && ! is_scalar($value)) {
-                return [];
+            if (! self::canCrossProcess($value)) {
+                return null;
             }
 
             $parameters[$parameter->name] = $value;
         }
 
         return $parameters;
+    }
+
+    /**
+     * Whether a constructor argument can ride back in a concurrency result.
+     */
+    protected static function canCrossProcess(mixed $value): bool
+    {
+        try {
+            serialize($value);
+
+            return true;
+        } catch (Throwable) {
+            return false;
+        }
     }
 }

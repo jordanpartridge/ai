@@ -3,6 +3,7 @@
 namespace Tests\Fixtures\Tools;
 
 use Illuminate\Contracts\JsonSchema\JsonSchema;
+use Illuminate\Support\Collection;
 use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Tools\Request;
 use RuntimeException;
@@ -18,6 +19,7 @@ class SequentialEchoTool implements Tool
         public int $code = 0,
         public int $pause = 0,
         public bool $labeled = false,
+        public bool $bare = false,
     ) {}
 
     public static function reset(): void
@@ -44,7 +46,11 @@ class SequentialEchoTool implements Tool
         }
 
         if ($this->labeled) {
-            throw new LabeledToolException($this->label);
+            throw new LabeledToolException($this->label, new Collection([$this->label]));
+        }
+
+        if ($this->bare) {
+            throw new EmptyToolException;
         }
 
         if ($this->throws) {
